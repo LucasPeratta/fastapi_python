@@ -1,87 +1,21 @@
-from ast import get_docstring
-from fastapi import Depends, FastAPI, HTTPException, Header, Request
-from sqlalchemy import Column, Integer, String, Enum
-from sqlalchemy.ext.declarative import declarative_base  # Importa declarative_base
-from enum import Enum as PyEnum
-import mysql.connector
+from fastapi import Depends, FastAPI, HTTPException, Request
 import jwt
+import mysql.connector
+from db_config import db_config, get_db, init_db
+from auth import create_jwt_token, verify_jwt_token
+from fastapi import Depends
+import schedule
+import time
+import threading
 
-SECRET_KEY = "abc123"
-
-def create_jwt_token(data: dict):
-    return jwt.encode(data, SECRET_KEY, algorithm="HS256")
-
-def verify_jwt_token(token: str):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        # Imprime un mensaje de registro para verificar que la validación fue exitosa
-        print("Token JWT válido:", payload)
-        return payload
-    except jwt.PyJWTError:
-        # Imprime un mensaje de registro para verificar que la validación falló
-        print("Error de validación del token JWT")
-        raise HTTPException(status_code=401, detail="Token inválido o expirado")
-
-
-# Define la función de dependencia get_db
-def get_db():
-    try:
-        # Aquí colocarías la lógica para conectarte a la base de datos
-        db_config = {
-            "host": "localhost",
-            "user": "root",
-            "password": "root",
-            "database": "python"
-        }
-        connection = mysql.connector.connect(**db_config)
-        cursor = connection.cursor()
-        yield (connection, cursor)
-    finally:
-        cursor.close()
-        connection.close()
 
 
 
 app = FastAPI()
 
-# Configura la conexión a la base de datos
-db_config = {
-    "host": "localhost",
-    "user": "root",
-    "password": "root",
-    "database": "python"
-}
+init_db()
 
-def create_users_table():
-    try:
-        connection = mysql.connector.connect(**db_config)
-        cursor = connection.cursor()
-
-        # Verifica si la tabla 'users' ya existe
-        cursor.execute("SHOW TABLES LIKE 'users'")
-        result = cursor.fetchone()
-
-        if result is None:
-            # La tabla 'users' no existe, la creamos
-            create_table_query = """
-            CREATE TABLE users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255),
-                surname VARCHAR(255),
-                email VARCHAR(255) UNIQUE,
-                user_level ENUM('admin', 'user', 'guest'),
-                password VARCHAR(255)
-            );
-            """
-            cursor.execute(create_table_query)
-
-        connection.commit()
-        connection.close()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al crear la tabla 'users': {str(e)}")
-
-# Llama a la función para crear la tabla 'users' al iniciar la aplicación
-create_users_table()
+contador=0
 
 @app.post('/login')
 def login(user: dict, db=Depends(get_db)):
@@ -89,106 +23,127 @@ def login(user: dict, db=Depends(get_db)):
 
     cursor.execute("SELECT * FROM users WHERE email = %s", (user['email'],))
     user_data = cursor.fetchone()
-
+    print(user_data)
     if user_data is not None:
-        # Accede a la contraseña en el segundo elemento de la tupla
-        if user['password'] == user_data[1]:
-            token = create_jwt_token({"sub": user['email']})
+        password= user_data[5]
+        user_level=user_data[4]
+        email= user_data[3]
+        if user['password'] == password:
+            token = create_jwt_token({"sub": email, "user_level": user_level})
             return {"access_token": token, "token_type": "bearer"}
 
     raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
-@app.get('/users')
-def get_users(request: Request):
-    try:
-        token = request.headers.get('Authorization').split(" ")[1]  # Obtener el token del encabezado
+from fastapi import Query
 
-        # Verifica el token JWT
+@app.get('/users')
+def list_users(
+    request: Request,
+    name: str = Query(None, description="Filtrar por nombre de usuario"),
+    email: str = Query(None, description="Filtrar por dirección de correo electrónico"),
+    page: int = Query(1, description="Número de página", gt=0),
+    page_size: int = Query(10, description="Tamaño de la página", gt=0, le=100)
+):
+    global contador
+    contador = contador + 1
+    try:
+        token = request.headers.get('Authorization').split(" ")[1]
+
         payload = verify_jwt_token(token)
 
-        # Si la verificación es exitosa, obtiene los usuarios.
+        # Calcular el índice de inicio y fin para la paginación
+        start_index = (page - 1) * page_size
+
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM users")
+
+        query = "SELECT * FROM users WHERE 1=1"
+        params = {}
+
+        if name:
+            query += " AND name = %(name)s"
+            params["name"] = name
+
+        if email:
+            query += " AND email = %(email)s"
+            params["email"] = email
+
+        query += " LIMIT %(start_index)s, %(page_size)s"
+        params["start_index"] = start_index
+        params["page_size"] = page_size
+
+        cursor.execute(query, params)
         users = cursor.fetchall()
         connection.close()
         return users
     except jwt.PyJWTError as e:
-        return {" Token JWT inválido: " + str(e)}
- 
-
-    
-from fastapi import Depends, Security
+        return {"error": "Token JWT inválido: " + str(e)}
 
 
 @app.post('/users')
 def create_user(user: dict, request: Request):
+    global contador
+    contador = contador + 1
     try:
-        token = request.headers.get('Authorization').split(" ")[1]  # Obtener el token del encabezado
-        print("Token obtenido:", token)  # Impresión para verificar el token
+        token = request.headers.get('Authorization').split(" ")[1]  
 
         # Verifica el token JWT
         payload = verify_jwt_token(token)
-        print("Token JWT verificado:", payload)  # Impresión para verificar el payload del token
 
            # Agrega una declaración de impresión para verificar el contenido del objeto 'user'
         print("User:", user)
 
-        # # Verifica si el usuario tiene el nivel de acceso adecuado (por ejemplo, "admin")
-        # if payload.get("user_level") != "admin":
-        #     raise HTTPException(status_code=403, detail="No tiene permisos para crear usuarios.")
-
-        # Establece la conexión a la base de datos y crea el usuario
+    except Exception as e:
+        print("Error al validar JWT", e)
+        return {"error": "Token JWT inválido: " + str(e)}
+      
+    try:    
+        if payload.get("user_level") != "admin":
+            raise HTTPException(status_code=403, detail="No tiene permisos para crear usuarios.")
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor()
         insert_query = "INSERT INTO users (name, surname, email, user_level, password) VALUES (%s, %s, %s, %s, %s)"
         cursor.execute(insert_query, (user['name'], user['surname'], user['email'], user['user_level'], user['password']))
         connection.commit()
         connection.close()
-        return user
-    except jwt.PyJWTError as e:
-        print("Error en PyJWT:", e)
-        return {"error": "Token JWT inválido: " + str(e)}
-    except HTTPException as e:
-        print("Error en HTTPException:", e.detail)
-        return {"error": str(e)}
+        return user   
     except Exception as e:
         print("Error general:", e)
         return {"error": f"Error al crear usuario: {str(e)}"}
+    
 
-
-# Define Base usando declarative_base
-Base = declarative_base()
-
-# Define la clase User como subclase de Base
-class User(Base):
-    # Especificamos el nombre de la tabla en la base de datos
-    __tablename__ = "users"
-
-    # Definimos las columnas de la tabla
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
-    surname = Column(String, index=True)
-    email = Column(String, unique=True, index=True)
-    user_level = Column(Enum("admin", "user", "guest"))
-    password = Column(String)
-
-
-def create_jwt_token(data: dict):
-    return jwt.encode(data, SECRET_KEY, algorithm="HS256")
-
-def verify_jwt_token(token: str):
+@app.get('/contador')
+def get_contador(request: Request):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        # Imprime un mensaje de registro para verificar que la validación fue exitosa
-        print("Token JWT válido:", payload)
-        return payload
-    except jwt.PyJWTError:
-        # Imprime un mensaje de registro para verificar que la validación falló
-        print("Error de validación del token JWT")
-        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+        token = request.headers.get('Authorization').split(" ")[1]       
+        payload = verify_jwt_token(token)
+        return {"contador": contador}
+    except jwt.PyJWTError as e:
+        return {"error": "Token JWT inválido: " + str(e)}
+    
+print_lock = threading.Lock()
+    
+def incrementar_contador():
+    global contador
+    contador += 1
+    with print_lock:
+        print(f"Valor actual del contador: {contador}")
+
+
+
+schedule.every(5).minutes.do(incrementar_contador)
+
+def programar_tareas():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Iniciar el hilo para programar tareas
+tarea_thread = threading.Thread(target=programar_tareas)
+tarea_thread.start()
 
 
 if __name__ == '__main__':
     import uvicorn
+    # Resto del código
     uvicorn.run(app, host='0.0.0.0', port=8000)
